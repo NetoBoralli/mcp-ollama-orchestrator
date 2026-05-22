@@ -1,18 +1,29 @@
 """MCP connection management, tool discovery, and validated tool execution.
 
-`MCPHub` owns the lifetime of every server connection via a single
-`AsyncExitStack`, aggregates their tools into one flat namespace for the model,
-and routes each call back to the server that owns the tool — validating the
-arguments against that server's published JSON Schema before they ever leave the
-process.
+`MCPHub` aggregates one or more MCP servers into a single flat tool namespace for
+the model and routes each call back to the owning server — validating arguments
+against that server's published JSON Schema before they leave the process.
+
+Connection lifecycle
+---------------------
+The MCP SDK's stdio / Streamable HTTP transports each spawn their own internal
+anyio task group. Decomposing those onto one app-lifetime ``AsyncExitStack`` is a
+known footgun: when a connection fails (or even on ordinary shutdown) the stack
+unwinds a transport whose task group lives in a different task, raising
+``RuntimeError: Attempted to exit cancel scope in a different task``.
+
+To avoid that entirely, each server runs in its own dedicated asyncio task whose
+``async with`` blocks open the transport, keep it alive, and tear it down — all
+within that single task. The hub coordinates startup/shutdown with events. This
+is the same pattern battle-tested by the wider MCP ecosystem.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
-from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Any, Self
@@ -33,6 +44,18 @@ logger = logging.getLogger(__name__)
 _NAME_SAFE = re.compile(r"[^a-zA-Z0-9_-]")
 
 
+def _root_cause(exc: BaseException) -> BaseException:
+    """Drill through nested ExceptionGroups to the first concrete leaf cause.
+
+    The SDK transports wrap failures in their own task-group ExceptionGroups, so
+    a raw ``eg.exceptions[0]`` is often just another group. This yields the actual
+    error (e.g. the underlying ``httpx.ConnectError``) for a readable message.
+    """
+    while isinstance(exc, BaseExceptionGroup) and exc.exceptions:
+        exc = exc.exceptions[0]
+    return exc
+
+
 @dataclass(slots=True)
 class RegisteredTool:
     """A discovered tool plus the routing/validation context to invoke it."""
@@ -50,8 +73,15 @@ class MCPHub:
 
     def __init__(self, servers: dict[str, ServerConfig]) -> None:
         self._servers = servers
-        self._stack = AsyncExitStack()
         self._tools: dict[str, RegisteredTool] = {}
+
+        # Coordination primitives between the hub and the per-server tasks.
+        self._supervisor: asyncio.Task[None] | None = None
+        self._stop = asyncio.Event()  # set on shutdown -> servers unwind
+        self._ready = asyncio.Event()  # set once every server is connected
+        self._ready_count = 0
+        self._lock = asyncio.Lock()  # guards _tools / _ready_count
+        self._error: BaseException | None = None  # first startup failure, if any
 
     # --- Lifecycle --------------------------------------------------------- #
 
@@ -65,23 +95,73 @@ class MCPHub:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        # Closes every session and subprocess opened during connect(), in reverse
-        # order, regardless of how the run terminated.
-        await self._stack.aclose()
+        await self.aclose()
 
     async def connect(self) -> None:
-        """Open every configured server and discover its tools."""
-        for name, cfg in self._servers.items():
-            try:
-                session = await self._open_session(name, cfg)
+        """Start every server and block until all are ready (or one fails)."""
+        if not self._servers:
+            raise MCPConnectionError("no MCP servers configured")
+
+        self._supervisor = asyncio.create_task(self._supervise())
+        # _ready is set either by the last server signalling ready, or by the
+        # supervisor's failure path — so this wait always resolves.
+        await self._ready.wait()
+
+        if self._error is not None:
+            await self.aclose()
+            raise MCPConnectionError(f"failed to start MCP server(s): {self._error}") from self._error
+
+        logger.info(
+            "Connected %d server(s); %d tool(s) available", len(self._servers), len(self._tools)
+        )
+
+    async def aclose(self) -> None:
+        """Signal every server task to unwind and wait for them to finish."""
+        self._stop.set()
+        if self._supervisor is not None:
+            # The supervisor records failures on self._error, so awaiting it
+            # never re-raises here; we just want a clean join.
+            await self._supervisor
+            self._supervisor = None
+
+    async def _supervise(self) -> None:
+        """Run all per-server tasks under one TaskGroup for the hub's lifetime.
+
+        The group stays open while servers are parked on ``_stop``; it unwinds
+        cleanly once ``aclose`` sets the event. If any server raises during
+        startup, the group cancels its siblings and we record the cause.
+        """
+        try:
+            async with asyncio.TaskGroup() as tg:
+                for name, cfg in self._servers.items():
+                    tg.create_task(self._serve(name, cfg), name=f"mcp:{name}")
+        except* Exception as eg:
+            # Keep the first concrete cause for a readable error message.
+            self._error = _root_cause(eg)
+        finally:
+            # Unblock connect() whether startup succeeded or failed.
+            self._ready.set()
+
+    async def _serve(self, name: str, cfg: ServerConfig) -> None:
+        """Own one server connection start-to-finish inside a single task.
+
+        Entering and exiting the transport's context managers in the same task is
+        precisely what anyio's cancel scopes require — which is what makes this
+        teardown-safe where a shared AsyncExitStack is not.
+        """
+        async with self._transport(name, cfg) as streams:
+            # stdio yields (read, write); Streamable HTTP yields a third element
+            # (a session-id getter) we don't need.
+            read, write = streams[0], streams[1]
+            async with ClientSession(read, write) as session:
                 await session.initialize()
                 await self._discover(name, session)
-            except Exception as exc:  # noqa: BLE001 — annotate which server failed
-                raise MCPConnectionError(f"failed to connect to MCP server '{name}': {exc}") from exc
-        logger.info("Connected %d server(s); %d tool(s) available", len(self._servers), len(self._tools))
+                await self._signal_ready()
+                # Hold the connection open until the hub is shut down.
+                await self._stop.wait()
 
-    async def _open_session(self, name: str, cfg: ServerConfig) -> ClientSession:
-        """Open a transport + session, registering both with the exit stack."""
+    def _transport(self, name: str, cfg: ServerConfig) -> Any:
+        """Return (without entering) the transport context manager for a server."""
         if isinstance(cfg, StdioServerConfig):
             params = StdioServerParameters(
                 command=cfg.command,
@@ -90,36 +170,36 @@ class MCPHub:
                 # an empty dict would otherwise strip the environment entirely.
                 env={**os.environ, **cfg.env} if cfg.env else None,
             )
-            read, write = await self._stack.enter_async_context(stdio_client(params))
-        elif isinstance(cfg, StreamableHTTPServerConfig):
-            # streamablehttp_client yields a third value (a session-id getter)
-            # that we don't need here.
-            read, write, _ = await self._stack.enter_async_context(
-                streamablehttp_client(cfg.url, headers=cfg.headers)
-            )
-        else:  # pragma: no cover — exhaustiveness guard
-            raise MCPConnectionError(f"unknown transport for server '{name}'")
-
-        session = await self._stack.enter_async_context(ClientSession(read, write))
-        return session
+            return stdio_client(params)
+        if isinstance(cfg, StreamableHTTPServerConfig):
+            return streamablehttp_client(cfg.url, headers=cfg.headers)
+        raise MCPConnectionError(f"unknown transport for server '{name}'")  # pragma: no cover
 
     async def _discover(self, server: str, session: ClientSession) -> None:
         """Read the server's tool catalog and register each tool."""
         result = await session.list_tools()
-        for tool in result.tools:
-            exposed = self._qualify(server, tool.name)
-            if exposed in self._tools:
-                raise MCPConnectionError(f"tool name collision after sanitization: '{exposed}'")
-            self._tools[exposed] = RegisteredTool(
-                exposed_name=exposed,
-                server=server,
-                original_name=tool.name,
-                description=tool.description or "",
-                # MCP guarantees inputSchema is a JSON Schema object.
-                input_schema=tool.inputSchema or {"type": "object", "properties": {}},
-                session=session,
-            )
-            logger.debug("registered tool '%s' (from %s/%s)", exposed, server, tool.name)
+        async with self._lock:
+            for tool in result.tools:
+                exposed = self._qualify(server, tool.name)
+                if exposed in self._tools:
+                    raise MCPConnectionError(f"tool name collision after sanitization: '{exposed}'")
+                self._tools[exposed] = RegisteredTool(
+                    exposed_name=exposed,
+                    server=server,
+                    original_name=tool.name,
+                    description=tool.description or "",
+                    # MCP guarantees inputSchema is a JSON Schema object.
+                    input_schema=tool.inputSchema or {"type": "object", "properties": {}},
+                    session=session,
+                )
+                logger.debug("registered tool '%s' (from %s/%s)", exposed, server, tool.name)
+
+    async def _signal_ready(self) -> None:
+        """Mark one server connected; release connect() once all are up."""
+        async with self._lock:
+            self._ready_count += 1
+            if self._ready_count >= len(self._servers):
+                self._ready.set()
 
     @staticmethod
     def _qualify(server: str, tool_name: str) -> str:

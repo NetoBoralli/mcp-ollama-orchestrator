@@ -49,18 +49,31 @@ src/mcp_orchestrator/
 # 1. Install (editable)
 pip install -e .
 
-# 2. Pull a tool-calling model
-ollama pull llama3.1:8b
+# 2. Pull a model with strong native tool-calling
+ollama pull qwen2.5:7b        # 7-8B llama models are noticeably weaker at this
 
 # 3. Configure
 cp .env.example .env          # tweak num_ctx, model, etc.
 # edit mcp_servers.json for your MCP servers
 
 # 4. Run
-orchestrate "List the files under /tmp and summarize them."
+orchestrate "List the files under /private/tmp and summarize them."
 # ...or omit the prompt for an interactive REPL
 orchestrate -v
 ```
+
+> **macOS path note:** the default `mcp_servers.json` points the filesystem
+> server at `/tmp`, which macOS resolves to `/private/tmp`. The server enforces
+> its allowed directory against the *resolved* path, so a prompt that says `/tmp`
+> comes back as `Access denied - path outside allowed directories: /tmp not in
+> /private/tmp`. Refer to **`/private/tmp`** in your prompts, or point the server
+> at a non-symlinked directory (e.g. `~/mcp-workdir`) to avoid the confusion.
+>
+> **Model note:** if the agent returns a JSON tool call as plain *text* instead
+> of acting on it (e.g. `{"name": "...", "parameters": {...}}` in the final
+> answer), the model has dropped out of native tool-calling — a known weakness of
+> smaller open-weight models. Switch to a stronger tool-caller such as
+> `qwen2.5:7b`/`qwen2.5:14b` or `mistral-nemo`.
 
 ## Context window note
 
