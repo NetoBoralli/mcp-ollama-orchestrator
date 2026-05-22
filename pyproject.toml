@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mcp-ollama-orchestrator"
+version = "0.1.0"
+description = "Generic, type-safe agent loop wiring self-hosted Ollama to MCP servers."
+requires-python = ">=3.11"
+readme = "README.md"
+dependencies = [
+    # MCP client SDK: connections, sessions, tool discovery, tool execution.
+    "mcp>=1.2.0",
+    # Async HTTP to Ollama's REST API. Chosen over the `ollama` lib so we keep
+    # full, explicit control over the request body (notably `options.num_ctx`).
+    "httpx>=0.27",
+    # Typed envelopes for every message and tool-call crossing a boundary.
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    # Dynamic validation of tool arguments against the JSON Schema each MCP
+    # server publishes at runtime. Pydantic can't model arbitrary runtime schemas.
+    "jsonschema>=4.21",
+]
+
+[project.optional-dependencies]
+dev = ["ruff>=0.4", "mypy>=1.10"]
+
+[project.scripts]
+orchestrate = "mcp_orchestrator.main:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcp_orchestrator"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+plugins = ["pydantic.mypy"]

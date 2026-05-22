@@ -1,0 +1,12 @@
+{
+  "filesystem": {
+    "transport": "stdio",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+  },
+  "_example_remote_server": {
+    "transport": "streamable_http",
+    "url": "https://your-mcp-host.example.com/mcp",
+    "headers": { "Authorization": "Bearer REPLACE_ME" }
+  }
+}
